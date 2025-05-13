@@ -14,10 +14,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double mesAsk;
         private double esBid;
         private double esAsk;
-        private int tradeDirection; 
+        private int tradeDirection; // 1 = ES overvalued, -1 = MES overvalued
         private const double TickSize = 0.25;
-        private const double EntryThreshold = 6; 
-        private const double ExitThreshold = 1;  
+        private const double EntryThreshold = 4; // Ticks
+        private const double ExitThreshold = 1;  // Ticks
 
         protected override void OnStateChange()
         {
@@ -27,11 +27,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Name = "MESESPairsTrading";
                 Calculate = Calculate.OnEachTick;
                 IsUnmanaged = true;
+                TraceOrders = true;
             }
             else if (State == State.Configure)
             {
-                AddDataSeries("MES 06-25", BarsPeriodType.Tick, 1);
-                AddDataSeries("ES 06-25", BarsPeriodType.Tick, 1);
+                AddDataSeries("MES 06-25", BarsPeriodType.Tick, 1); // Index 0: MES
+                AddDataSeries("ES 06-25", BarsPeriodType.Tick, 1);  // Index 1: ES
             }
             else if (State == State.Terminated)
             {
@@ -44,14 +45,18 @@ namespace NinjaTrader.NinjaScript.Strategies
             // Update MES prices
             if (e.Instrument == Instruments[0])
             {
-                if (e.MarketDataType == MarketDataType.Bid) mesBid = e.Price;
-                else if (e.MarketDataType == MarketDataType.Ask) mesAsk = e.Price;
+                if (e.MarketDataType == MarketDataType.Bid)
+                    mesBid = e.Price;
+                else if (e.MarketDataType == MarketDataType.Ask)
+                    mesAsk = e.Price;
             }
             // Update ES prices
             else if (e.Instrument == Instruments[1])
             {
-                if (e.MarketDataType == MarketDataType.Bid) esBid = e.Price;
-                else if (e.MarketDataType == MarketDataType.Ask) esAsk = e.Price;
+                if (e.MarketDataType == MarketDataType.Bid)
+                    esBid = e.Price;
+                else if (e.MarketDataType == MarketDataType.Ask)
+                    esAsk = e.Price;
             }
 
             if (mesBid > 0 && mesAsk > 0 && esBid > 0 && esAsk > 0)
@@ -60,32 +65,81 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void ProcessStrategyLogic()
         {
-            double currentSpread = esBid - mesAsk; // Positive = ES overvalued, Negative = MES overvalued
-            double spreadTicks = currentSpread / TickSize;
+            // Determine overvaluation direction and calculate executable spread
+            bool esOvervalued = false;
+            bool mesOvervalued = false;
+            double executableSpread = 0;
+            double spreadTicks = 0;
+            string scenario = "";
 
-            Print($"{Time} - Spread: {spreadTicks:N1} ticks | Direction: {(currentSpread > 0 ? "ES Overvalued" : "MES Overvalued")}");
+            // Check ES overvaluation (Buy MES, Sell ES)
+            double esSellPrice = esBid - TickSize;
+            double mesBuyPrice = mesAsk + TickSize;
+            double esSpread = esSellPrice - mesBuyPrice;
+            
+            // Check MES overvaluation (Sell MES, Buy ES)
+            double mesSellPrice = mesBid - TickSize;
+            double esBuyPrice = esAsk + TickSize;
+            double mesSpread = esBuyPrice - mesSellPrice;
+
+            if (esSpread >= EntryThreshold * TickSize)
+            {
+                esOvervalued = true;
+                executableSpread = esSpread;
+                scenario = "ES Overvalued";
+            }
+            else if (mesSpread <= -EntryThreshold * TickSize)
+            {
+                mesOvervalued = true;
+                executableSpread = mesSpread;
+                scenario = "MES Overvalued";
+            }
+
+            spreadTicks = executableSpread / TickSize;
 
             // Entry Conditions
             if (tradeDirection == 0)
             {
-                if (spreadTicks >= EntryThreshold) // ES overvalued
+                if (esOvervalued)
                 {
+                    Print($"{Time} ENTRY SIGNAL: {scenario}");
+                    Print($"{Time} MES Buy Limit: {mesBuyPrice:F2} | ES Sell Limit: {esSellPrice:F2}");
+                    Print($"{Time} Executable Spread: {executableSpread:F2} ({spreadTicks:N1} ticks)");
                     tradeDirection = 1;
                     SubmitEntryOrders();
                 }
-                else if (spreadTicks <= -EntryThreshold) // MES overvalued
+                else if (mesOvervalued)
                 {
+                    Print($"{Time} ENTRY SIGNAL: {scenario}");
+                    Print($"{Time} MES Sell Limit: {mesSellPrice:F2} | ES Buy Limit: {esBuyPrice:F2}");
+                    Print($"{Time} Executable Spread: {executableSpread:F2} ({spreadTicks:N1} ticks)");
                     tradeDirection = -1;
                     SubmitEntryOrders();
                 }
             }
-            // Exit Conditions
+            // Exit Conditions (uses same executable spread logic)
             else
             {
-                bool shouldExit = (tradeDirection == 1 && spreadTicks <= ExitThreshold) ||
-                                 (tradeDirection == -1 && spreadTicks >= -ExitThreshold);
+                double currentSpread = 0;
+                if (tradeDirection == 1) // Closing ES overvalued
+                {
+                    currentSpread = (esBid - TickSize) - (mesAsk + TickSize);
+                }
+                else if (tradeDirection == -1) // Closing MES overvalued
+                {
+                    currentSpread = (esAsk + TickSize) - (mesBid - TickSize);
+                }
+                double currentSpreadTicks = currentSpread / TickSize;
 
-                if (shouldExit) SubmitExitOrders();
+                bool shouldExit = (tradeDirection == 1 && currentSpreadTicks <= ExitThreshold) ||
+                                (tradeDirection == -1 && currentSpreadTicks >= -ExitThreshold);
+
+                if (shouldExit)
+                {
+                    Print($"{Time} EXIT SIGNAL");
+                    Print($"{Time} Current Spread: {currentSpread:F2} ({currentSpreadTicks:N1} ticks)");
+                    SubmitExitOrders();
+                }
             }
         }
 
@@ -93,29 +147,40 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (tradeDirection == 1) // ES overvalued: Buy MES, Sell ES
             {
-                SubmitOrderUnmanaged(0, OrderAction.Buy, OrderType.Limit, 10, mesAsk + TickSize, 0, null, "MES_Long");
-                SubmitOrderUnmanaged(1, OrderAction.Sell, OrderType.Limit, 1, esBid - TickSize, 0, null, "ES_Short");
+                double mesLimit = mesAsk + TickSize;
+                double esLimit = esBid - TickSize;
+                
+                SubmitOrderUnmanaged(1, OrderAction.Buy, OrderType.Limit, 10, mesLimit, 0, null, "MES_Long");
+                SubmitOrderUnmanaged(0, OrderAction.Sell, OrderType.Limit, 1, esLimit, 0, null, "ES_Short");
             }
             else if (tradeDirection == -1) // MES overvalued: Sell MES, Buy ES
             {
-                SubmitOrderUnmanaged(0, OrderAction.Sell, OrderType.Limit, 10, mesBid - TickSize, 0, null, "MES_Short");
-                SubmitOrderUnmanaged(1, OrderAction.Buy, OrderType.Limit, 1, esAsk + TickSize, 0, null, "ES_Long");
+                double mesLimit = mesBid - TickSize;
+                double esLimit = esAsk + TickSize;
+                
+                SubmitOrderUnmanaged(1, OrderAction.Sell, OrderType.Limit, 10, mesLimit, 0, null, "MES_Short");
+                SubmitOrderUnmanaged(0, OrderAction.Buy, OrderType.Limit, 1, esLimit, 0, null, "ES_Long");
             }
         }
 
         private void SubmitExitOrders()
         {
-            if (tradeDirection == 1) // Close ES overvalued position
+            if (tradeDirection == 1) // Close ES overvalued
             {
-                SubmitOrderUnmanaged(0, OrderAction.Sell, OrderType.Limit, 10, mesBid - TickSize, 0, null, "MES_Exit");
-                SubmitOrderUnmanaged(1, OrderAction.Buy, OrderType.Limit, 1, esAsk + TickSize, 0, null, "ES_Exit");
+                double mesLimit = mesBid - TickSize;
+                double esLimit = esAsk + TickSize;
+                
+                SubmitOrderUnmanaged(1, OrderAction.Sell, OrderType.Limit, 10, mesLimit, 0, null, "MES_Exit");
+                SubmitOrderUnmanaged(0, OrderAction.Buy, OrderType.Limit, 1, esLimit, 0, null, "ES_Exit");
             }
-            else if (tradeDirection == -1) // Close MES overvalued position
+            else if (tradeDirection == -1) // Close MES overvalued
             {
-                SubmitOrderUnmanaged(0, OrderAction.Buy, OrderType.Limit, 10, mesAsk + TickSize, 0, null, "MES_Exit");
-                SubmitOrderUnmanaged(1, OrderAction.Sell, OrderType.Limit, 1, esBid - TickSize, 0, null, "ES_Exit");
+                double mesLimit = mesAsk + TickSize;
+                double esLimit = esBid - TickSize;
+                
+                SubmitOrderUnmanaged(1, OrderAction.Buy, OrderType.Limit, 10, mesLimit, 0, null, "MES_Exit");
+                SubmitOrderUnmanaged(0, OrderAction.Sell, OrderType.Limit, 1, esLimit, 0, null, "ES_Exit");
             }
-           
             tradeDirection = 0;
         }
 
@@ -125,8 +190,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (orderState == OrderState.Filled)
             {
-                double slippage = Math.Abs(averageFillPrice - limitPrice);
-                Print($"{Time} - {order.Name} filled @ {averageFillPrice} (Slippage: {slippage/TickSize:N2} ticks)");
+                string instrument = order.Instrument.MasterInstrument.Name;
+                double slippage = Math.Abs(averageFillPrice - limitPrice)/TickSize;
+                Print($"{Time} FILLED: {instrument} {order.Name} @ {averageFillPrice} (Slippage: {slippage:N1} ticks)");
             }
         }
     }
